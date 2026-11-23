@@ -1,0 +1,142 @@
+---
+- name: Parches Windows desde WSUS o Internet con manejo de errores por host
+  hosts: all
+  gather_facts: no
+  serial: 1
+  any_errors_fatal: no
+
+  vars:
+    wsus_reg_path: 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    wsus_au_path: 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+    reboot_timeout_seconds: 3600
+    update_categories:
+      - All
+    exclude_categories:
+      - Drivers
+
+  tasks:
+    - name: Verificar conectividad WinRM
+      ansible.windows.win_ping:
+      register: ping_result
+      ignore_errors: yes
+
+    - name: Marcar host como no disponible si falla WinRM
+      ansible.builtin.set_fact:
+        patch_status: "winrm_failed"
+      when: ping_result is failed
+
+    - name: Leer configuración WSUS
+      ansible.windows.win_reg_stat:
+        path: "{{ wsus_reg_path }}"
+      register: wsus_reg
+      when: patch_status is not defined
+
+    - name: Leer configuración AU
+      ansible.windows.win_reg_stat:
+        path: "{{ wsus_au_path }}"
+      register: wsus_au
+      when: patch_status is not defined
+
+    - name: Obtener configuración de Windows Update
+      ansible.windows.win_shell: |
+        $result = [PSCustomObject]@{
+          WUServer = $null
+          WUStatusServer = $null
+          UseWUServer = $null
+        }
+
+        if (Test-Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate") {
+          $ws = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" -ErrorAction SilentlyContinue
+          $result.WUServer = $ws.WUServer
+          $result.WUStatusServer = $ws.WUStatusServer
+        }
+
+        if (Test-Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU") {
+          $au = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -ErrorAction SilentlyContinue
+          $result.UseWUServer = $au.UseWUServer
+        }
+
+        $result | ConvertTo-Json -Compress
+      register: wu_config_raw
+      when: patch_status is not defined
+      ignore_errors: yes
+
+    - name: Parsear configuración
+      ansible.builtin.set_fact:
+        wu_config: "{{ wu_config_raw.stdout | from_json }}"
+      when:
+        - patch_status is not defined
+        - wu_config_raw is succeeded
+
+    - name: Determinar origen de actualizaciones
+      ansible.builtin.set_fact:
+        update_source: >-
+          {% if wu_config.UseWUServer is defined and (wu_config.UseWUServer | default(0) | int) == 1 %}
+          WSUS
+          {% else %}
+          Internet
+          {% endif %}
+      when: patch_status is not defined
+
+    - name: Mostrar origen detectado
+      ansible.builtin.debug:
+        msg: "El host {{ inventory_hostname }} actualizará por {{ update_source }}"
+      when: patch_status is not defined
+
+    - name: Forzar detección de actualizaciones
+      ansible.windows.win_shell: UsoClient StartScan
+      when: patch_status is not defined
+      ignore_errors: yes
+
+    - name: Instalar todas las actualizaciones disponibles
+      ansible.windows.win_updates:
+        category_names: "{{ update_categories }}"
+        reboot: no
+        state: installed
+        log_path: C:\log\ansible-win-updates.log
+      register: update_result
+      when: patch_status is not defined
+      ignore_errors: yes
+
+    - name: Registrar error de instalación si falla
+      ansible.builtin.set_fact:
+        patch_status: "update_failed"
+        patch_error: "{{ update_result.msg | default('Error desconocido durante la instalación') }}"
+      when:
+        - patch_status is not defined
+        - update_result is failed
+
+    - name: Reiniciar si es necesario
+      ansible.windows.win_reboot:
+        reboot_timeout: "{{ reboot_timeout_seconds }}"
+      when:
+        - patch_status is not defined
+        - update_result is succeeded
+        - update_result.reboot_required | default(false)
+      register: reboot_result
+      ignore_errors: yes
+
+    - name: Marcar error si falla el reinicio
+      ansible.builtin.set_fact:
+        patch_status: "reboot_failed"
+        patch_error: "{{ reboot_result.msg | default('Error desconocido durante el reinicio') }}"
+      when:
+        - patch_status is not defined
+        - reboot_result is failed
+
+    - name: Marcar éxito
+      ansible.builtin.set_fact:
+        patch_status: "success"
+      when:
+        - patch_status is not defined
+
+    - name: Resumen por host
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          update_source: "{{ update_source | default('unknown') }}"
+          status: "{{ patch_status }}"
+          reboot_required: "{{ update_result.reboot_required | default(false) if update_result is defined else false }}"
+          installed_update_count: "{{ update_result.installed_update_count | default(0) if update_result is defined else 0 }}"
+          failed_update_count: "{{ update_result.failed_update_count | default(0) if update_result is defined else 0 }}"
+          error: "{{ patch_error | default('') }}"
